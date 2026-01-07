@@ -607,9 +607,13 @@ async def kyutai_stream_loop(args, queue, recorder):
     while running:
         try:
             logging.info("Connecting to Kyutai server at %s", args.ws_url)
-            async with websockets.connect(
-                args.ws_url, additional_headers=headers
-            ) as websocket:
+            try:
+                websocket_ctx = websockets.connect(
+                    args.ws_url, additional_headers=headers
+                )
+            except TypeError:
+                websocket_ctx = websockets.connect(args.ws_url, extra_headers=headers)
+            async with websocket_ctx as websocket:
                 if not recorder.running.is_set():
                     logging.info("Kyutai connected; starting audio capture.")
                     recorder.start()
