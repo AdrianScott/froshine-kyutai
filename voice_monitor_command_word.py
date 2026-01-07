@@ -74,7 +74,7 @@ COMMAND_WORD_ALIASES = {
     for alias in aliases_env.split(",")
     if alias.strip()
 }
-COMMAND_WORD_ALIASES.update({"flo", "glow", "flowe", "fro", "hello", "helo"})
+# COMMAND_WORD_ALIASES.update({"flo", "glow", "flowe", "fro", "hello", "helo"})
 COMMAND_WORD_ALIASES.add(COMMAND_WORD)
 COMMAND_SYNONYMS = {
     "pause": ["pause", "paws", "paus", "pawz"],
