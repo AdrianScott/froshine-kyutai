@@ -225,10 +225,19 @@ def process_transcription_text(text: str, confidence: float):
 
     words = text.split()
     in_command_scope = False
+    skip_next_wake_word = False
 
     if USE_WAKE_WORD and pending_command_word:
         if words:
             first_norm = normalize_word(words[0])
+            if is_wake_word(first_norm):
+                if not is_paused:
+                    print(f"{pending_command_word} ({confidence:.2f})")
+                    type_text(pending_command_word, add_space=True)
+                pending_command_word = None
+                words.pop(0)
+                if not words:
+                    return
             is_cmd, recognized = interpret_potential_command(first_norm)
             if not is_cmd:
                 combined = pending_command_word + first_norm
@@ -256,7 +265,15 @@ def process_transcription_text(text: str, confidence: float):
     for i, w in enumerate(words):
         norm = normalize_word(w)
         if USE_WAKE_WORD:
+            if skip_next_wake_word:
+                skip_next_wake_word = False
+                continue
             if is_wake_word(norm) and i < len(words) - 1:
+                next_norm = normalize_word(words[i + 1])
+                if is_wake_word(next_norm):
+                    typed_words.append(w)
+                    skip_next_wake_word = True
+                    continue
                 in_command_scope = True
                 continue
             if is_wake_word(norm) and i == len(words) - 1:
