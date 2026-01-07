@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -607,12 +608,21 @@ async def kyutai_stream_loop(args, queue, recorder):
     while running:
         try:
             logging.info("Connecting to Kyutai server at %s", args.ws_url)
-            try:
+            connect_params = inspect.signature(websockets.connect).parameters
+            if "additional_headers" in connect_params:
                 websocket_ctx = websockets.connect(
                     args.ws_url, additional_headers=headers
                 )
-            except TypeError:
-                websocket_ctx = websockets.connect(args.ws_url, extra_headers=headers)
+            elif "extra_headers" in connect_params:
+                websocket_ctx = websockets.connect(
+                    args.ws_url, extra_headers=headers
+                )
+            else:
+                if headers:
+                    logging.warning(
+                        "Websocket client does not support headers; upgrade websockets."
+                    )
+                websocket_ctx = websockets.connect(args.ws_url)
             async with websocket_ctx as websocket:
                 if not recorder.running.is_set():
                     logging.info("Kyutai connected; starting audio capture.")
