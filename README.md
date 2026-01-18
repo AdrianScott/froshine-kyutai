@@ -83,7 +83,7 @@ FROSHINE_AUDIO_DEVICE="2" python voice_monitor_command_word.py
 
 ### Kyutai Streaming Setup
 
-1. Copy or customize the provided TOML config at `configs/config1-stt-en-hf.toml` (English-only, default). A multilingual `configs/config1-stt-en_fr-hf.toml` is also included if you need it. The client can auto-select a smaller config when free VRAM is low.
+1. Copy or customize the provided TOML config at `configs/config1-stt-en-hf.toml` (English-only, default). A multilingual `configs/config1-stt-en_fr-hf.toml` is also included if you need it. The client can auto-select a smaller config when free VRAM is low. If `log_dir` uses `$HOME` or `~`, auto-start will expand it into a sibling `.expanded.toml` file for portability.
 2. Auto-tune the server batch size based on your free GPU memory (defaults: 16 for < 23 GB free VRAM, 32 otherwise):
    ```bash
    python3 scripts/tune_kyutai_batch.py
@@ -132,6 +132,9 @@ Environment / CLI parameters:
 - `FROSHINE_MOSHI_SERVER_ARGS`: extra args forwarded to `moshi-server` when auto-starting (overrides auto-selected `--addr`/`--port` if provided).
 - `FROSHINE_AUTO_SERVER_STOP=1`: stop the auto-started server when the client exits.
 - `FROSHINE_MOSHI_LOG_LEVEL` (default: `warn`): log level for auto-started `moshi-server` unless overridden in `FROSHINE_MOSHI_SERVER_ARGS`.
+- `FROSHINE_MOSHI_READY_TIMEOUT` (default: 30): seconds to wait for the auto-started server to listen.
+- `FROSHINE_MOSHI_READY_INTERVAL` (default: 0.5): poll interval while waiting for auto-started readiness.
+- Auto-start expands `$HOME`/`~` in the Kyutai config `log_dir`, writing a `.expanded.toml` copy alongside the original config.
 - `FROSHINE_KYUTAI_AUTO_CONFIG=1`: auto-select a smaller config when free VRAM is below the threshold.
 - `FROSHINE_MIN_FREE_VRAM_EN_MB` (default: 12000): minimum free VRAM to use the 2.6B English model; otherwise the 1B en_fr config is selected.
 

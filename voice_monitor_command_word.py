@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
@@ -48,6 +49,8 @@ AUTO_SERVER_STOP = os.getenv("FROSHINE_AUTO_SERVER_STOP", "1").lower() not in (
     "false",
     "no",
 )
+AUTO_SERVER_READY_TIMEOUT = float(os.getenv("FROSHINE_MOSHI_READY_TIMEOUT", "30"))
+AUTO_SERVER_READY_INTERVAL = float(os.getenv("FROSHINE_MOSHI_READY_INTERVAL", "0.5"))
 DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parent / "configs" / "config1-stt-en-hf.toml"
 )
@@ -480,6 +483,52 @@ def select_config_path() -> Path:
     return DEFAULT_EN_CONFIG
 
 
+def expand_config_log_dir(config_path: Path) -> Path:
+    text = config_path.read_text()
+    match = re.search(r'^(log_dir\s*=\s*")([^"]*)(")', text, flags=re.MULTILINE)
+    if not match:
+        return config_path
+    original = match.group(2)
+    expanded = os.path.expandvars(os.path.expanduser(original))
+    if expanded == original:
+        return config_path
+    updated = (
+        text[: match.start(2)] + expanded + text[match.end(2) :]
+    )
+    expanded_path = config_path.with_name(
+        f"{config_path.stem}.expanded{config_path.suffix}"
+    )
+    expanded_path.write_text(updated)
+    return expanded_path
+
+
+async def wait_for_moshi_server(
+    ws_url: str, process: subprocess.Popen | None
+) -> bool:
+    addr, port = parse_moshi_server_target(ws_url)
+    if not addr or not port:
+        return False
+    deadline = time.monotonic() + AUTO_SERVER_READY_TIMEOUT
+    while time.monotonic() < deadline:
+        if process and process.poll() is not None:
+            logging.error(
+                "Auto-started moshi-server exited with code %s", process.returncode
+            )
+            return False
+        try:
+            reader, writer = await asyncio.open_connection(addr, port)
+            writer.close()
+            if hasattr(writer, "wait_closed"):
+                await writer.wait_closed()
+            return True
+        except OSError:
+            await asyncio.sleep(AUTO_SERVER_READY_INTERVAL)
+    logging.warning(
+        "Timed out waiting for moshi-server to listen on %s:%s", addr, port
+    )
+    return False
+
+
 def start_kyutai_server(ws_url: str) -> subprocess.Popen:
     config_path = select_config_path()
     subprocess.run(
@@ -491,6 +540,7 @@ def start_kyutai_server(ws_url: str) -> subprocess.Popen:
         ],
         check=True,
     )
+    config_path = expand_config_log_dir(config_path)
     extra_args = os.getenv("FROSHINE_MOSHI_SERVER_ARGS", "").split()
     addr, port = parse_moshi_server_target(ws_url)
     cmd = ["moshi-server", "worker", "--config", str(config_path)]
@@ -677,7 +727,17 @@ async def kyutai_stream_loop(args, queue, recorder):
                 if server_process is None or server_process.poll() is not None:
                     try:
                         server_process = start_kyutai_server(args.ws_url)
-                        await asyncio.sleep(2.0)
+                        logging.info(
+                            "Waiting for moshi-server to be ready (timeout %.1fs).",
+                            AUTO_SERVER_READY_TIMEOUT,
+                        )
+                        ready = await wait_for_moshi_server(
+                            args.ws_url, server_process
+                        )
+                        if not ready:
+                            logging.warning(
+                                "moshi-server did not become ready; will keep retrying."
+                            )
                         continue
                     except Exception as start_exc:
                         logging.error("Auto-start failed: %s", start_exc)
