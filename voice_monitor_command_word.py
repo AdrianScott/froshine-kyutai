@@ -83,9 +83,11 @@ COMMAND_SYNONYMS = {
     "pause": ["pause", "paws", "paus", "pawz"],
     "unpause": ["unpause", "onpause", "on pause", "un pause"],
     "enter": ["enter", "inner"],
-    "quit": ["quit", "quick"],
+    "quit": ["quit", "quick", "stop"],
     "switch to browser": ["switch to browser", "open browser"],
     "save file": ["save file", "save document"],
+    "enter command mode": ["mode command", "flow mode command"],
+    "exit command mode": ["mode stop", "flow mode stop"],
 }
 COMMANDS = {
     "enter": ["enter"],
@@ -94,16 +96,120 @@ COMMANDS = {
     "pause": ["pause"],
     "unpause": ["unpause"],
     "quit": ["quit"],
+    "enter command mode": ["mode command"],
+    "exit command mode": ["mode stop"],
 }
 
 running = True
 typed_history = ""
 is_paused = False
+command_mode = False
 pending_command_word = None
+pending_command_tokens = []
+pending_command_words = []
+pending_mode_tokens = []
+pending_mode_words = []
 server_process = None
 shutdown_event = None
 queue_ref = None
 loop_ref = None
+
+CONTROL_PHRASES = {
+    ("pause",): "pause",
+    ("paws",): "pause",
+    ("paus",): "pause",
+    ("pawz",): "pause",
+    ("unpause",): "unpause",
+    ("on", "pause"): "unpause",
+    ("onpause",): "unpause",
+    ("un", "pause"): "unpause",
+    ("enter",): "enter",
+    ("inner",): "enter",
+    ("quit",): "quit",
+    ("quick",): "quit",
+    ("stop",): "quit",
+    ("switch", "to", "browser"): "switch to browser",
+    ("open", "browser"): "switch to browser",
+    ("save", "file"): "save file",
+    ("save", "document"): "save file",
+    ("mode", "command"): "enter command mode",
+    ("mode", "stop"): "exit command mode",
+    ("flow", "mode", "command"): "enter command mode",
+    ("flow", "mode", "stop"): "exit command mode",
+}
+
+
+def build_flow_commands():
+    flow_commands = {}
+    for ch in "abcdefghijklmnopqrstuvwxyz":
+        flow_commands[(ch,)] = ("text", ch)
+    digit_words = {
+        "zero": "0",
+        "oh": "0",
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
+    }
+    for word, digit in digit_words.items():
+        flow_commands[(word,)] = ("text", digit)
+    for digit in "0123456789":
+        flow_commands[(digit,)] = ("text", digit)
+    punctuation = {
+        "comma": ",",
+        "period": ".",
+        "dot": ".",
+        "colon": ":",
+        "semicolon": ";",
+        "dash": "-",
+        "quote": "'",
+    }
+    for word, mark in punctuation.items():
+        flow_commands[(word,)] = ("text", mark)
+    flow_commands[("double", "quote")] = ("text", '"')
+    flow_commands[("question", "mark")] = ("text", "?")
+    flow_commands[("question",)] = ("text", "?")
+    flow_commands[("exclamation", "mark")] = ("text", "!")
+    flow_commands[("exclamation",)] = ("text", "!")
+    flow_commands[("newline",)] = ("key", "Return")
+    flow_commands[("space",)] = ("text", " ")
+    flow_commands[("tab",)] = ("key", "Tab")
+    flow_commands[("backspace",)] = ("key", "BackSpace")
+    flow_commands[("escape",)] = ("key", "Escape")
+    flow_commands[("esc",)] = ("key", "Escape")
+    flow_commands[("up",)] = ("key", "Up")
+    flow_commands[("down",)] = ("key", "Down")
+    flow_commands[("left",)] = ("key", "Left")
+    flow_commands[("right",)] = ("key", "Right")
+    flow_commands[("click", "left")] = ("click", 1)
+    flow_commands[("click", "right")] = ("click", 3)
+    return flow_commands
+
+
+FLOW_COMMANDS = build_flow_commands()
+CONTROL_PHRASES_BY_LEN = sorted(CONTROL_PHRASES.keys(), key=len, reverse=True)
+FLOW_COMMANDS_BY_LEN = sorted(FLOW_COMMANDS.keys(), key=len, reverse=True)
+MACROS = {
+    ("quick", "save"): [
+        ("click", 3),
+        ("sleep", 0.15),
+        ("text", "v"),
+        ("sleep", 0.1),
+        ("key", "Return"),
+        ("sleep", 0.1),
+    ],
+}
+MACRO_PHRASES_BY_LEN = sorted(MACROS.keys(), key=len, reverse=True)
+PHRASE_PREFIXES = {
+    phrase[:idx]
+    for phrase in (*CONTROL_PHRASES.keys(), *FLOW_COMMANDS.keys(), *MACROS.keys())
+    for idx in range(1, len(phrase))
+}
 
 
 def parse_args():
@@ -157,7 +263,7 @@ def log_transcription(transcription, is_command=False, confidence=None):
 
 
 def execute_command(command):
-    global running, is_paused
+    global running, is_paused, command_mode
     logging.info("Command recognized: %s", command)
     if command == "quit":
         print("\nQuitting voice commander...")
@@ -172,6 +278,16 @@ def execute_command(command):
                 except asyncio.QueueFull:
                     pass
             loop_ref.call_soon_threadsafe(_signal_queue)
+        return
+    if command == "enter command mode":
+        command_mode = True
+        logging.info("Command mode enabled")
+        print("Command mode enabled.")
+        return
+    if command == "exit command mode":
+        command_mode = False
+        logging.info("Command mode disabled")
+        print("Command mode disabled.")
         return
     if command == "enter":
         subprocess.run(["xdotool", "key", "Return"])
@@ -193,18 +309,52 @@ def normalize_word(word: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", word.lower())
 
 
-def find_command_for_synonym(syn: str) -> str:
-    for cmd, synonyms_list in COMMAND_SYNONYMS.items():
-        if syn in synonyms_list and cmd in COMMANDS:
-            return cmd
-    return ""
+def match_phrase(tokens, start, phrase_list, phrase_map):
+    for phrase in phrase_list:
+        length = len(phrase)
+        if start + length > len(tokens):
+            continue
+        if tokens[start : start + length] == list(phrase):
+            return phrase_map[phrase], length
+    return None, 0
 
 
-def interpret_potential_command(norm_word: str):
-    cmd_key = find_command_for_synonym(norm_word)
-    if cmd_key:
-        return True, cmd_key
-    return False, ""
+def match_control_command(tokens, start):
+    return match_phrase(tokens, start, CONTROL_PHRASES_BY_LEN, CONTROL_PHRASES)
+
+
+def match_flow_command(tokens, start):
+    return match_phrase(tokens, start, FLOW_COMMANDS_BY_LEN, FLOW_COMMANDS)
+
+
+def match_macro(tokens, start):
+    return match_phrase(tokens, start, MACRO_PHRASES_BY_LEN, MACROS)
+
+
+def type_text_raw(text: str):
+    global typed_history
+    if not text:
+        return
+    subprocess.run(["xdotool", "type", "--delay", "0", text])
+    typed_history += text
+
+
+def execute_flow_action(action):
+    action_type, value = action
+    if action_type == "text":
+        type_text_raw(value)
+    elif action_type == "key":
+        subprocess.run(["xdotool", "key", value])
+    elif action_type == "click":
+        subprocess.run(["xdotool", "click", str(value)])
+
+
+def execute_macro(steps):
+    for action_type, value in steps:
+        if action_type == "sleep":
+            time.sleep(value)
+        else:
+            execute_flow_action((action_type, value))
 
 
 def is_wake_word(token: str) -> bool:
@@ -221,87 +371,164 @@ def is_wake_word(token: str) -> bool:
 
 
 def process_transcription_text(text: str, confidence: float):
-    global typed_history, is_paused, pending_command_word
+    global typed_history, is_paused, pending_command_word, command_mode
+    global pending_command_tokens, pending_command_words
+    global pending_mode_tokens, pending_mode_words
 
     if not text:
         return
 
     words = text.split()
+    if not words:
+        return
+
+    tokens = [normalize_word(word) for word in words]
+
+    def apply_direct_commands():
+        nonlocal words, tokens
+        if pending_mode_tokens:
+            words = pending_mode_words + words
+            tokens = pending_mode_tokens + tokens
+            pending_mode_tokens.clear()
+            pending_mode_words.clear()
+        idx = 0
+        typed_words = []
+        while idx < len(tokens):
+            cmd, cmd_len = match_control_command(tokens, idx)
+            if cmd:
+                snippet = " ".join(words[idx : idx + cmd_len])
+                log_transcription(snippet, is_command=True, confidence=confidence)
+                print(f"COMMAND: {cmd} ({confidence:.2f})")
+                execute_command(cmd)
+                idx += cmd_len
+                continue
+            macro, macro_len = match_macro(tokens, idx)
+            if macro:
+                snippet = " ".join(words[idx : idx + macro_len])
+                log_transcription(snippet, is_command=True, confidence=confidence)
+                print(f"COMMAND: {snippet} ({confidence:.2f})")
+                execute_macro(macro)
+                idx += macro_len
+                continue
+            action, action_len = match_flow_command(tokens, idx)
+            if action:
+                snippet = " ".join(words[idx : idx + action_len])
+                log_transcription(snippet, is_command=True, confidence=confidence)
+                print(f"COMMAND: {snippet} ({confidence:.2f})")
+                execute_flow_action(action)
+                idx += action_len
+                continue
+            remaining = tuple(tokens[idx:])
+            if remaining in PHRASE_PREFIXES:
+                pending_mode_tokens[:] = list(remaining)
+                pending_mode_words[:] = words[idx:]
+                break
+            typed_words.append(words[idx])
+            idx += 1
+        if not is_paused and typed_words:
+            joined = " ".join(typed_words)
+            log_transcription(joined, confidence=confidence)
+            print(f"{joined} ({confidence:.2f})")
+            type_text(joined, add_space=True)
+
+    if command_mode or not USE_WAKE_WORD:
+        pending_command_word = None
+        pending_command_tokens.clear()
+        pending_command_words.clear()
+        if tokens and tokens[0] in COMMAND_WORD_ALIASES:
+            words = words[1:]
+            tokens = tokens[1:]
+        if not tokens:
+            return
+        apply_direct_commands()
+        return
+
     in_command_scope = False
     skip_next_wake_word = False
-
-    if USE_WAKE_WORD and pending_command_word:
-        if words:
-            first_norm = normalize_word(words[0])
-            if is_wake_word(first_norm):
-                if not is_paused:
-                    print(f"{pending_command_word} ({confidence:.2f})")
-                    type_text(pending_command_word, add_space=True)
-                pending_command_word = None
-                words.pop(0)
-                if not words:
-                    return
-            is_cmd, recognized = interpret_potential_command(first_norm)
-            if not is_cmd:
-                combined = pending_command_word + first_norm
-                is_cmd, recognized = interpret_potential_command(combined)
-            if is_cmd:
-                snippet = f"{pending_command_word} {words[0]}"
-                log_transcription(snippet, is_command=True, confidence=confidence)
-                print(f"COMMAND: {recognized} ({confidence:.2f})")
-                execute_command(recognized)
-                words.pop(0)
-                in_command_scope = False
-            else:
-                if not is_paused:
-                    print(f"{pending_command_word} ({confidence:.2f})")
-                    type_text(pending_command_word, add_space=True)
-        else:
-            if not is_paused:
-                print(f"{pending_command_word} ({confidence:.2f})")
-                type_text(pending_command_word, add_space=True)
-        pending_command_word = None
-    elif not USE_WAKE_WORD:
-        pending_command_word = None
-
     typed_words = []
-    for i, w in enumerate(words):
-        norm = normalize_word(w)
-        if USE_WAKE_WORD:
-            if skip_next_wake_word:
-                skip_next_wake_word = False
-                continue
-            if is_wake_word(norm) and i < len(words) - 1:
-                next_norm = normalize_word(words[i + 1])
+
+    if pending_command_word:
+        if tokens and is_wake_word(tokens[0]):
+            if not is_paused:
+                log_transcription(COMMAND_WORD, confidence=confidence)
+                print(f"{COMMAND_WORD} ({confidence:.2f})")
+                type_text(COMMAND_WORD, add_space=True)
+            pending_command_word = None
+        else:
+            in_command_scope = True
+            pending_command_word = None
+    if pending_command_tokens:
+        in_command_scope = True
+        words = pending_command_words + words
+        tokens = pending_command_tokens + tokens
+        pending_command_tokens.clear()
+        pending_command_words.clear()
+
+    i = 0
+    while i < len(words):
+        norm = tokens[i]
+        if skip_next_wake_word:
+            skip_next_wake_word = False
+            i += 1
+            continue
+        if is_wake_word(norm):
+            if i < len(words) - 1:
+                next_norm = tokens[i + 1]
                 if is_wake_word(next_norm):
-                    typed_words.append(w)
+                    typed_words.append(words[i])
                     skip_next_wake_word = True
+                    i += 1
                     continue
                 in_command_scope = True
+                i += 1
                 continue
-            if is_wake_word(norm) and i == len(words) - 1:
-                pending_command_word = COMMAND_WORD
+            pending_command_word = COMMAND_WORD
+            i += 1
+            continue
+        if in_command_scope:
+            cmd, cmd_len = match_control_command(tokens, i)
+            if cmd:
+                snippet = " ".join(words[i : i + cmd_len])
+                log_transcription(snippet, is_command=True, confidence=confidence)
+                print(f"COMMAND: {cmd} ({confidence:.2f})")
+                execute_command(cmd)
+                i += cmd_len
+                in_command_scope = False
                 continue
-            if in_command_scope:
-                is_cmd, recognized = interpret_potential_command(norm)
-                if is_cmd:
-                    log_transcription(w, is_command=True, confidence=confidence)
-                    print(f"COMMAND: {recognized} ({confidence:.2f})")
-                    execute_command(recognized)
-                    in_command_scope = False
-                else:
-                    typed_words.append(w)
-                    in_command_scope = False
-            else:
-                typed_words.append(w)
-        else:
-            is_cmd, recognized = interpret_potential_command(norm)
-            if is_cmd:
-                log_transcription(w, is_command=True, confidence=confidence)
-                print(f"COMMAND: {recognized} ({confidence:.2f})")
-                execute_command(recognized)
-            else:
-                typed_words.append(w)
+            macro, macro_len = match_macro(tokens, i)
+            if macro:
+                snippet = " ".join(words[i : i + macro_len])
+                log_transcription(snippet, is_command=True, confidence=confidence)
+                print(f"COMMAND: {snippet} ({confidence:.2f})")
+                execute_macro(macro)
+                i += macro_len
+                in_command_scope = False
+                continue
+            action, action_len = match_flow_command(tokens, i)
+            if action:
+                snippet = " ".join(words[i : i + action_len])
+                log_transcription(snippet, is_command=True, confidence=confidence)
+                print(f"COMMAND: {snippet} ({confidence:.2f})")
+                execute_flow_action(action)
+                i += action_len
+                in_command_scope = False
+                continue
+            remaining = tuple(tokens[i:])
+            if remaining and remaining[0] in COMMAND_WORD_ALIASES:
+                typed_words.append(words[i])
+                in_command_scope = False
+                i += 1
+                continue
+            if remaining in PHRASE_PREFIXES:
+                pending_command_tokens[:] = list(remaining)
+                pending_command_words[:] = words[i:]
+                break
+            typed_words.append(words[i])
+            in_command_scope = False
+            i += 1
+            continue
+        typed_words.append(words[i])
+        i += 1
 
     if not is_paused and typed_words:
         joined = " ".join(typed_words)
@@ -792,7 +1019,10 @@ def main():
             f"Say:\n  '{COMMAND_WORD} pause' or '{COMMAND_WORD} unpause' to control transcription."
         )
         print(
-            f"  '{COMMAND_WORD} quit' to stop the program;\n  '{COMMAND_WORD} enter' to press Enter\n"
+            f"  '{COMMAND_WORD} quit' or '{COMMAND_WORD} stop' to stop the program;\n"
+            f"  '{COMMAND_WORD} enter' to press Enter;\n"
+            f"  '{COMMAND_WORD} mode command' to enter command mode;\n"
+            f"  '{COMMAND_WORD} mode stop' to exit command mode\n"
         )
     else:
         print("Wake word disabled—commands execute as soon as they are recognized.\n")

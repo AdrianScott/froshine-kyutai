@@ -117,7 +117,21 @@ Begin speaking: The system will detect speech and automatically type the transcr
 - Say "Flow save file" to simulate Ctrl+S.
 - Say "Flow pause" to stop typing text (commands still work).
 - Say "Flow unpause" to resume typing text.
-- Stop the script: Say "Flow quit", or press Ctrl+C in the terminal to exit.
+- Stop the script: Say "Flow quit" or "Flow stop", or press Ctrl+C in the terminal to exit.
+- Command mode:
+  - Say "Flow mode command" to enter command mode (no wake word required for flow commands).
+  - Say "Flow mode stop" to exit command mode.
+
+**Flow commands (say "Flow <command>" outside command mode):**
+
+- **Punctuation:** comma, period, colon, semicolon, dash, quote, double quote, question mark, exclamation, newline.
+- **Keys:** letters A–Z, digits 0–9 (also zero–nine), space, tab, enter, backspace, escape.
+- **Arrows:** up, down, left, right.
+- **Mouse:** click left, click right.
+
+**Macros:**
+
+- **Quick save:** say "Flow quick save" (or "quick save" in command mode). Executes right click, short pause, `v`, short pause, Enter, short pause.
 
 Environment / CLI parameters:
 
