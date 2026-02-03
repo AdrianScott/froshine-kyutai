@@ -81,7 +81,7 @@ COMMAND_WORD_ALIASES = {
 COMMAND_WORD_ALIASES.add(COMMAND_WORD)
 COMMAND_SYNONYMS = {
     "pause": ["pause", "paws", "paus", "pawz"],
-    "unpause": ["unpause", "onpause", "on pause", "un pause"],
+    "unpause": ["unpause", "onpause", "on pause", "un pause", "continue"],
     "enter": ["enter", "inner"],
     "quit": ["quit", "quick", "stop"],
     "switch to browser": ["switch to browser", "open browser"],
@@ -94,7 +94,7 @@ COMMANDS = {
     "switch to browser": ["switch to browser"],
     "save file": ["save file"],
     "pause": ["pause"],
-    "unpause": ["unpause"],
+    "unpause": ["unpause", "continue"],
     "quit": ["quit"],
     "enter command mode": ["mode command"],
     "exit command mode": ["mode stop"],
@@ -123,6 +123,7 @@ CONTROL_PHRASES = {
     ("on", "pause"): "unpause",
     ("onpause",): "unpause",
     ("un", "pause"): "unpause",
+    ("continue",): "unpause",
     ("enter",): "enter",
     ("inner",): "enter",
     ("quit",): "quit",
@@ -335,7 +336,7 @@ def type_text_raw(text: str):
     global typed_history
     if not text:
         return
-    subprocess.run(["xdotool", "type", "--delay", "0", text])
+    subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text])
     typed_history += text
 
 
@@ -545,7 +546,7 @@ def type_text(text: str, add_space: bool = False):
     payload = prefix + text
     if add_space and payload and payload[-1] not in {".", "!", "?", " "}:
         payload += " "
-    subprocess.run(["xdotool", "type", "--delay", "0", payload])
+    subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", payload])
     typed_history += payload
 
 

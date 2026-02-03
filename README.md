@@ -116,7 +116,7 @@ Begin speaking: The system will detect speech and automatically type the transcr
 - Say "Flow enter" to press Enter (use `--word` or `FROSHINE_COMMAND_WORD` to change it).
 - Say "Flow save file" to simulate Ctrl+S.
 - Say "Flow pause" to stop typing text (commands still work).
-- Say "Flow unpause" to resume typing text.
+- Say "Flow unpause" or "Flow continue" to resume typing text.
 - Stop the script: Say "Flow quit" or "Flow stop", or press Ctrl+C in the terminal to exit.
 - Command mode:
   - Say "Flow mode command" to enter command mode (no wake word required for flow commands).
