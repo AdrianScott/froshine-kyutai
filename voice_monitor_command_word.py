@@ -384,6 +384,11 @@ def process_transcription_text(text: str, confidence: float):
         return
 
     tokens = [normalize_word(word) for word in words]
+    def print_wake_pair(wake_word: str, following_word: str | None):
+        if following_word:
+            print(f"WAKE: {wake_word} {following_word} ({confidence:.2f})")
+        else:
+            print(f"WAKE: {wake_word} (pending) ({confidence:.2f})")
 
     def apply_direct_commands():
         nonlocal words, tokens
@@ -437,6 +442,8 @@ def process_transcription_text(text: str, confidence: float):
         pending_command_tokens.clear()
         pending_command_words.clear()
         if tokens and tokens[0] in COMMAND_WORD_ALIASES:
+            next_word = words[1] if len(words) > 1 else None
+            print_wake_pair(words[0], next_word)
             words = words[1:]
             tokens = tokens[1:]
         if not tokens:
@@ -457,6 +464,7 @@ def process_transcription_text(text: str, confidence: float):
             pending_command_word = None
         else:
             in_command_scope = True
+            print_wake_pair(pending_command_word, words[0] if words else None)
             pending_command_word = None
     if pending_command_tokens:
         in_command_scope = True
@@ -475,6 +483,7 @@ def process_transcription_text(text: str, confidence: float):
         if is_wake_word(norm):
             if i < len(words) - 1:
                 next_norm = tokens[i + 1]
+                print_wake_pair(words[i], words[i + 1])
                 if is_wake_word(next_norm):
                     typed_words.append(words[i])
                     skip_next_wake_word = True
@@ -484,6 +493,7 @@ def process_transcription_text(text: str, confidence: float):
                 i += 1
                 continue
             pending_command_word = COMMAND_WORD
+            print_wake_pair(words[i], None)
             i += 1
             continue
         if in_command_scope:
@@ -848,7 +858,7 @@ def handle_semantic_vad(step_msg):
         if probs:
             pause_prob = probs[SEMANTIC_VAD_HEAD]
             if pause_prob > SEMANTIC_VAD_THRESHOLD:
-                logging.info(
+                logging.debug(
                     "Semantic VAD pause detected (head=%s prob=%.2f)",
                     SEMANTIC_VAD_HEAD,
                     pause_prob,
