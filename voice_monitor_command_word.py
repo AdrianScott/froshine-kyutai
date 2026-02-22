@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 import time
+import wave
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
@@ -28,6 +29,13 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.WARNING)
 console_handler.setFormatter(logging.Formatter("%(message)s"))
 logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
 
 # Audio capture configuration
 SAMPLE_RATE = 24000
@@ -113,6 +121,7 @@ server_process = None
 shutdown_event = None
 queue_ref = None
 loop_ref = None
+output_manager = None
 
 CONTROL_PHRASES = {
     ("pause",): "pause",
@@ -138,6 +147,25 @@ CONTROL_PHRASES = {
     ("flow", "mode", "command"): "enter command mode",
     ("flow", "mode", "stop"): "exit command mode",
 }
+
+SAVE_AUDIO_ENV = parse_bool_env("FROSHINE_SAVE_AUDIO", False)
+SAVE_TRANSCRIPT_ENV = parse_bool_env("FROSHINE_SAVE_TRANSCRIPT", False)
+DEFAULT_OUTPUT_DIR = os.getenv("FROSHINE_OUTPUT_DIR", "outputs")
+DEFAULT_AUDIO_ROTATE_HOURS = float(os.getenv("FROSHINE_AUDIO_ROTATE_HOURS", "1"))
+DEFAULT_AUDIO_FORMAT = os.getenv("FROSHINE_AUDIO_FORMAT", "opus").strip().lower()
+if DEFAULT_AUDIO_FORMAT not in ("wav", "opus"):
+    logging.warning(
+        "Invalid FROSHINE_AUDIO_FORMAT=%s; falling back to 'opus'.",
+        DEFAULT_AUDIO_FORMAT,
+    )
+    DEFAULT_AUDIO_FORMAT = "opus"
+try:
+    DEFAULT_AUDIO_BITRATE_KBPS = int(os.getenv("FROSHINE_AUDIO_BITRATE_KBPS", "16"))
+except ValueError:
+    logging.warning(
+        "Invalid FROSHINE_AUDIO_BITRATE_KBPS value; falling back to 16."
+    )
+    DEFAULT_AUDIO_BITRATE_KBPS = 16
 
 
 def build_flow_commands():
@@ -249,10 +277,50 @@ def parse_args():
         action="store_true",
         help="Do not auto-start moshi-server when the websocket is unreachable",
     )
+    parser.add_argument(
+        "--save-audio",
+        action=argparse.BooleanOptionalAction,
+        default=SAVE_AUDIO_ENV,
+        help="Save microphone audio to file (default from FROSHINE_SAVE_AUDIO)",
+    )
+    parser.add_argument(
+        "--save-transcript",
+        action=argparse.BooleanOptionalAction,
+        default=SAVE_TRANSCRIPT_ENV,
+        help="Save transcription text to file (default from FROSHINE_SAVE_TRANSCRIPT)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory for saved audio/transcripts (default from FROSHINE_OUTPUT_DIR)",
+    )
+    parser.add_argument(
+        "--audio-rotate-hours",
+        type=float,
+        default=DEFAULT_AUDIO_ROTATE_HOURS,
+        help=(
+            "Rotate saved audio file every N hours; 0 disables "
+            "(default from FROSHINE_AUDIO_ROTATE_HOURS)"
+        ),
+    )
+    parser.add_argument(
+        "--audio-format",
+        choices=("wav", "opus"),
+        default=DEFAULT_AUDIO_FORMAT,
+        help="Audio output format for saved microphone data (default from FROSHINE_AUDIO_FORMAT)",
+    )
+    parser.add_argument(
+        "--audio-bitrate-kbps",
+        type=int,
+        default=DEFAULT_AUDIO_BITRATE_KBPS,
+        help="Target bitrate (kbps) when --audio-format=opus (default from FROSHINE_AUDIO_BITRATE_KBPS)",
+    )
     return parser.parse_args()
 
 
 def log_transcription(transcription, is_command=False, confidence=None):
+    if output_manager and not is_command:
+        output_manager.write_transcript(transcription)
     log_entry = {
         "timestamp": datetime.now().isoformat(),
         "type": "command" if is_command else "transcription",
@@ -740,6 +808,201 @@ def expand_config_log_dir(config_path: Path) -> Path:
     return expanded_path
 
 
+def resolve_output_dir(raw_dir: str | None) -> Path:
+    if raw_dir:
+        return Path(raw_dir).expanduser()
+    return Path(DEFAULT_OUTPUT_DIR)
+
+
+def next_output_path(output_dir: Path, date_prefix: str, label: str, ext: str) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pattern = re.compile(
+        rf"^{re.escape(date_prefix)}-{re.escape(label)}-(\d+)\.{re.escape(ext)}$"
+    )
+    max_index = 0
+    for entry in output_dir.iterdir():
+        if not entry.is_file():
+            continue
+        match = pattern.match(entry.name)
+        if match:
+            try:
+                max_index = max(max_index, int(match.group(1)))
+            except ValueError:
+                continue
+    index = max_index + 1
+    path = output_dir / f"{date_prefix}-{label}-{index}.{ext}"
+    while path.exists():
+        index += 1
+        path = output_dir / f"{date_prefix}-{label}-{index}.{ext}"
+    return path
+
+
+class OutputManager:
+    def __init__(
+        self,
+        output_dir: Path,
+        save_audio: bool,
+        save_transcript: bool,
+        sample_rate: int,
+        channels: int,
+        sample_width: int,
+        audio_rotate_hours: float,
+        audio_format: str,
+        audio_bitrate_kbps: int,
+    ):
+        self.output_dir = output_dir
+        self.save_audio = save_audio
+        self.save_transcript = save_transcript
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.sample_width = sample_width
+        self.audio_rotate_hours = audio_rotate_hours
+        self.audio_format = audio_format
+        self.audio_bitrate_kbps = max(6, audio_bitrate_kbps)
+        self.audio_path = None
+        self.audio_tmp_path = None
+        self.text_path = None
+        self.audio_file = None
+        self.text_file = None
+        self.lock = threading.Lock()
+        self.audio_opened_at = None
+
+    def _open_audio_segment(self, date_prefix: str):
+        if self.audio_format == "opus":
+            self.audio_path = next_output_path(
+                self.output_dir, date_prefix, "audio", "ogg"
+            )
+            self.audio_tmp_path = self.audio_path.with_suffix(".tmp.wav")
+            wav_target = self.audio_tmp_path
+        else:
+            self.audio_path = next_output_path(
+                self.output_dir, date_prefix, "audio", "wav"
+            )
+            self.audio_tmp_path = None
+            wav_target = self.audio_path
+        self.audio_file = wave.open(str(wav_target), "wb")
+        self.audio_file.setnchannels(self.channels)
+        self.audio_file.setsampwidth(self.sample_width)
+        self.audio_file.setframerate(self.sample_rate)
+        self.audio_opened_at = datetime.now()
+        if self.audio_format == "opus":
+            logging.info(
+                "Saving audio to %s (opus %sk; temp wav %s)",
+                self.audio_path,
+                self.audio_bitrate_kbps,
+                wav_target,
+            )
+        else:
+            logging.info("Saving audio to %s", self.audio_path)
+
+    def _finalize_audio_segment(self):
+        if not self.audio_file:
+            return
+        self.audio_file.close()
+        self.audio_file = None
+        self.audio_opened_at = None
+        if (
+            self.audio_format != "opus"
+            or not self.audio_tmp_path
+            or not self.audio_path
+        ):
+            return
+        temp_wav = self.audio_tmp_path
+        target = self.audio_path
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(temp_wav),
+            "-c:a",
+            "libopus",
+            "-b:a",
+            f"{self.audio_bitrate_kbps}k",
+            "-vbr",
+            "on",
+            "-compression_level",
+            "10",
+            str(target),
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+            temp_wav.unlink(missing_ok=True)
+            logging.info(
+                "Saved audio to %s (opus %sk)",
+                target,
+                self.audio_bitrate_kbps,
+            )
+        except Exception as exc:
+            fallback = target.with_suffix(".wav")
+            try:
+                temp_wav.replace(fallback)
+                logging.warning(
+                    "Opus conversion failed (%s). Kept WAV fallback at %s.",
+                    exc,
+                    fallback,
+                )
+                self.audio_path = fallback
+            except Exception as fallback_exc:
+                logging.error(
+                    "Opus conversion failed (%s) and WAV fallback failed (%s).",
+                    exc,
+                    fallback_exc,
+                )
+        finally:
+            self.audio_tmp_path = None
+
+    def open(self):
+        date_prefix = datetime.now().strftime("%Y-%m-%d")
+        if self.save_audio:
+            self._open_audio_segment(date_prefix)
+        if self.save_transcript:
+            self.text_path = next_output_path(
+                self.output_dir, date_prefix, "text", "txt"
+            )
+            self.text_file = self.text_path.open("a", encoding="utf-8")
+            logging.info("Saving transcripts to %s", self.text_path)
+
+    def _rotate_audio_if_needed(self):
+        if not self.audio_file or self.audio_rotate_hours <= 0:
+            return
+        if not self.audio_opened_at:
+            return
+        elapsed = datetime.now() - self.audio_opened_at
+        if elapsed.total_seconds() < self.audio_rotate_hours * 3600:
+            return
+        self._finalize_audio_segment()
+        self.audio_path = None
+        self.audio_tmp_path = None
+        date_prefix = datetime.now().strftime("%Y-%m-%d")
+        self._open_audio_segment(date_prefix)
+        logging.info("Rotated audio; now saving to %s", self.audio_path)
+
+    def write_audio(self, data: bytes):
+        if not self.audio_file:
+            return
+        with self.lock:
+            self._rotate_audio_if_needed()
+            self.audio_file.writeframes(data)
+
+    def write_transcript(self, text: str):
+        if not self.text_file:
+            return
+        with self.lock:
+            self.text_file.write(text + "\n")
+            self.text_file.flush()
+
+    def close(self):
+        with self.lock:
+            if self.audio_file:
+                self._finalize_audio_segment()
+            if self.text_file:
+                self.text_file.close()
+                self.text_file = None
+
+
 async def wait_for_moshi_server(
     ws_url: str, process: subprocess.Popen | None
 ) -> bool:
@@ -830,6 +1093,8 @@ class AudioRecorder:
             except Exception as exc:
                 logging.error("Audio capture error: %s", exc)
                 break
+            if output_manager:
+                output_manager.write_audio(data)
             frame = np.frombuffer(data, dtype=np.float32).copy()
 
             def enqueue():
@@ -987,6 +1252,7 @@ async def kyutai_stream_loop(args, queue, recorder):
 async def run_async(args):
     global running
     global shutdown_event, queue_ref, loop_ref
+    global output_manager
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue(maxsize=200)
     shutdown_event = asyncio.Event()
@@ -997,9 +1263,35 @@ async def run_async(args):
         get_input_device_info(args.device, list_only=True)
         return
 
+    if args.audio_bitrate_kbps < 6:
+        logging.warning(
+            "audio_bitrate_kbps=%s is too low for Opus; using 6 kbps.",
+            args.audio_bitrate_kbps,
+        )
+        args.audio_bitrate_kbps = 6
+
     device_info = get_input_device_info(args.device)
     if not device_info:
         raise RuntimeError("No audio input devices available")
+
+    if args.save_audio or args.save_transcript:
+        audio = pyaudio.PyAudio()
+        try:
+            sample_width = audio.get_sample_size(FORMAT)
+        finally:
+            audio.terminate()
+        output_manager = OutputManager(
+            resolve_output_dir(args.output_dir),
+            args.save_audio,
+            args.save_transcript,
+            SAMPLE_RATE,
+            CHANNELS,
+            sample_width,
+            args.audio_rotate_hours,
+            args.audio_format,
+            args.audio_bitrate_kbps,
+        )
+        output_manager.open()
 
     recorder = AudioRecorder(loop, queue, device_info["index"])
 
@@ -1012,6 +1304,9 @@ async def run_async(args):
             recorder.stop()
         if server_process and AUTO_SERVER_STOP and server_process.poll() is None:
             server_process.terminate()
+        if output_manager:
+            output_manager.close()
+            output_manager = None
 
 
 def main():

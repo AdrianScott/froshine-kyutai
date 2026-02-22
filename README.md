@@ -151,6 +151,13 @@ Environment / CLI parameters:
 - Auto-start expands `$HOME`/`~` in the Kyutai config `log_dir`, writing a `.expanded.toml` copy alongside the original config.
 - `FROSHINE_KYUTAI_AUTO_CONFIG=1`: auto-select a smaller config when free VRAM is below the threshold.
 - `FROSHINE_MIN_FREE_VRAM_EN_MB` (default: 12000): minimum free VRAM to use the 2.6B English model; otherwise the 1B en_fr config is selected.
+- `FROSHINE_SAVE_AUDIO` or `--save-audio/--no-save-audio`: save microphone audio to file.
+- `FROSHINE_SAVE_TRANSCRIPT` or `--save-transcript/--no-save-transcript`: save transcriptions to a text file.
+- `FROSHINE_OUTPUT_DIR` or `--output-dir`: directory for saved audio/transcripts (default: `outputs`).
+- `FROSHINE_AUDIO_ROTATE_HOURS` or `--audio-rotate-hours`: rotate audio WAV files every N hours (0 disables; default: 1).
+- `FROSHINE_AUDIO_FORMAT` or `--audio-format`: saved audio format (`opus` default, or `wav`).
+- `FROSHINE_AUDIO_BITRATE_KBPS` or `--audio-bitrate-kbps`: target bitrate when using Opus (default: 16).
+- Saved files are named like `2026-02-21-audio-1.ogg` (Opus) or `2026-02-21-audio-1.wav`, and `2026-02-21-text-1.txt`.
 
 ## Troubleshooting 
 
