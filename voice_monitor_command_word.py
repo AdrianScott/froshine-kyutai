@@ -846,6 +846,8 @@ class OutputManager:
         sample_rate: int,
         channels: int,
         sample_width: int,
+        capture_format: int,
+        capture_sample_width: int,
         audio_rotate_hours: float,
         audio_format: str,
         audio_bitrate_kbps: int,
@@ -856,6 +858,8 @@ class OutputManager:
         self.sample_rate = sample_rate
         self.channels = channels
         self.sample_width = sample_width
+        self.capture_format = capture_format
+        self.capture_sample_width = capture_sample_width
         self.audio_rotate_hours = audio_rotate_hours
         self.audio_format = audio_format
         self.audio_bitrate_kbps = max(6, audio_bitrate_kbps)
@@ -985,7 +989,17 @@ class OutputManager:
             return
         with self.lock:
             self._rotate_audio_if_needed()
-            self.audio_file.writeframes(data)
+            if (
+                self.capture_format == pyaudio.paFloat32
+                and self.sample_width == 2
+                and self.capture_sample_width == 4
+            ):
+                float_data = np.frombuffer(data, dtype=np.float32)
+                int_data = np.clip(float_data, -1.0, 1.0)
+                pcm16 = (int_data * 32767.0).astype(np.int16)
+                self.audio_file.writeframes(pcm16.tobytes())
+            else:
+                self.audio_file.writeframes(data)
 
     def write_transcript(self, text: str):
         if not self.text_file:
@@ -1277,16 +1291,24 @@ async def run_async(args):
     if args.save_audio or args.save_transcript:
         audio = pyaudio.PyAudio()
         try:
-            sample_width = audio.get_sample_size(FORMAT)
+            capture_sample_width = audio.get_sample_size(FORMAT)
         finally:
             audio.terminate()
+        file_sample_width = capture_sample_width
+        if FORMAT == pyaudio.paFloat32:
+            file_sample_width = 2
+            logging.info(
+                "Converting float32 capture to 16-bit PCM for saved audio files."
+            )
         output_manager = OutputManager(
             resolve_output_dir(args.output_dir),
             args.save_audio,
             args.save_transcript,
             SAMPLE_RATE,
             CHANNELS,
-            sample_width,
+            file_sample_width,
+            FORMAT,
+            capture_sample_width,
             args.audio_rotate_hours,
             args.audio_format,
             args.audio_bitrate_kbps,
