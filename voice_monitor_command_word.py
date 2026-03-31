@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import wave
@@ -29,6 +30,16 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.WARNING)
 console_handler.setFormatter(logging.Formatter("%(message)s"))
 logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+
+
+def emit_console_status(message: str, *, started_at: float | None = None) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed_suffix = ""
+    if started_at is not None:
+        elapsed_suffix = f" (elapsed {time.monotonic() - started_at:.1f}s)"
+    text = f"[{timestamp}] {message}{elapsed_suffix}"
+    print(text, file=sys.stderr, flush=True)
+    logging.info("%s%s", message, elapsed_suffix)
 
 def parse_bool_env(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -122,6 +133,7 @@ shutdown_event = None
 queue_ref = None
 loop_ref = None
 output_manager = None
+startup_ready_started_at = None
 
 CONTROL_PHRASES = {
     ("pause",): "pause",
@@ -1018,7 +1030,7 @@ class OutputManager:
 
 
 async def wait_for_moshi_server(
-    ws_url: str, process: subprocess.Popen | None
+    ws_url: str, process: subprocess.Popen | None, started_at: float | None = None
 ) -> bool:
     addr, port = parse_moshi_server_target(ws_url)
     if not addr or not port:
@@ -1035,6 +1047,10 @@ async def wait_for_moshi_server(
             writer.close()
             if hasattr(writer, "wait_closed"):
                 await writer.wait_closed()
+            emit_console_status(
+                f"moshi-server is listening on {addr}:{port}; connecting for transcription.",
+                started_at=started_at,
+            )
             return True
         except OSError:
             await asyncio.sleep(AUTO_SERVER_READY_INTERVAL)
@@ -1045,6 +1061,7 @@ async def wait_for_moshi_server(
 
 
 def start_kyutai_server(ws_url: str) -> subprocess.Popen:
+    global startup_ready_started_at
     config_path = select_config_path()
     subprocess.run(
         [
@@ -1055,6 +1072,8 @@ def start_kyutai_server(ws_url: str) -> subprocess.Popen:
         ],
         check=True,
     )
+    startup_ready_started_at = time.monotonic()
+    emit_console_status("Free VRAM check complete; loading moshi-server model.")
     config_path = expand_config_log_dir(config_path)
     extra_args = os.getenv("FROSHINE_MOSHI_SERVER_ARGS", "").split()
     addr, port = parse_moshi_server_target(ws_url)
@@ -1181,6 +1200,7 @@ async def receive_server_messages(websocket, loop):
 
 async def kyutai_stream_loop(args, queue, recorder):
     global server_process
+    global startup_ready_started_at
     headers = {}
     if args.api_key:
         headers["kyutai-api-key"] = args.api_key
@@ -1209,7 +1229,11 @@ async def kyutai_stream_loop(args, queue, recorder):
                 websocket_ctx = websockets.connect(args.ws_url)
             async with websocket_ctx as websocket:
                 if not recorder.running.is_set():
-                    logging.info("Kyutai connected; starting audio capture.")
+                    emit_console_status(
+                        "Kyutai connected; ready to transcribe audio. Starting audio capture.",
+                        started_at=startup_ready_started_at,
+                    )
+                    startup_ready_started_at = None
                     recorder.start()
                 backoff = 1
                 async def wait_for_shutdown():
@@ -1244,12 +1268,12 @@ async def kyutai_stream_loop(args, queue, recorder):
                 if server_process is None or server_process.poll() is not None:
                     try:
                         server_process = start_kyutai_server(args.ws_url)
-                        logging.info(
-                            "Waiting for moshi-server to be ready (timeout %.1fs).",
-                            AUTO_SERVER_READY_TIMEOUT,
+                        emit_console_status(
+                            "Waiting for moshi-server to be ready "
+                            f"(timeout {AUTO_SERVER_READY_TIMEOUT:.1f}s)."
                         )
                         ready = await wait_for_moshi_server(
-                            args.ws_url, server_process
+                            args.ws_url, server_process, startup_ready_started_at
                         )
                         if not ready:
                             logging.warning(
