@@ -291,9 +291,17 @@ def parse_args():
     )
     parser.add_argument(
         "--save-audio",
-        action=argparse.BooleanOptionalAction,
+        dest="save_audio",
+        action="store_true",
         default=SAVE_AUDIO_ENV,
         help="Save microphone audio to file (default from FROSHINE_SAVE_AUDIO)",
+    )
+    parser.add_argument(
+        "-n",
+        "--no-save-audio",
+        dest="save_audio",
+        action="store_false",
+        help="Do not save microphone audio to file",
     )
     parser.add_argument(
         "--save-transcript",
