@@ -4,6 +4,7 @@ import inspect
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -82,7 +83,7 @@ DEFAULT_MIN_FREE_VRAM_EN_MB = 12000
 # Command configuration
 COMMAND_WORD = os.getenv("FROSHINE_COMMAND_WORD", "flow").lower()
 WAKE_WORD_RATIO_THRESHOLD = float(
-    os.getenv("FROSHINE_COMMAND_WORD_SIMILARITY", "0.7")
+    os.getenv("FROSHINE_COMMAND_WORD_SIMILARITY", "0.65")
 )
 ENV_REQUIRE_WAKE_WORD = os.getenv("FROSHINE_REQUIRE_WAKE_WORD", "1").lower() not in (
     "0",
@@ -91,12 +92,15 @@ ENV_REQUIRE_WAKE_WORD = os.getenv("FROSHINE_REQUIRE_WAKE_WORD", "1").lower() not
 )
 USE_WAKE_WORD = ENV_REQUIRE_WAKE_WORD
 aliases_env = os.getenv("FROSHINE_COMMAND_WORD_ALIASES", "")
+DEFAULT_COMMAND_WORD_ALIASES = {
+    "flow": {"flo", "glow", "flowe", "fro", "hello", "helo"},
+}
 COMMAND_WORD_ALIASES = {
     alias.strip().lower()
     for alias in aliases_env.split(",")
     if alias.strip()
 }
-# COMMAND_WORD_ALIASES.update({"flo", "glow", "flowe", "fro", "hello", "helo"})
+COMMAND_WORD_ALIASES.update(DEFAULT_COMMAND_WORD_ALIASES.get(COMMAND_WORD, set()))
 COMMAND_WORD_ALIASES.add(COMMAND_WORD)
 COMMAND_SYNONYMS = {
     "pause": ["pause", "paws", "paus", "pawz"],
@@ -178,6 +182,76 @@ except ValueError:
         "Invalid FROSHINE_AUDIO_BITRATE_KBPS value; falling back to 16."
     )
     DEFAULT_AUDIO_BITRATE_KBPS = 16
+DEFAULT_TEXT_INPUT_MODE = os.getenv("FROSHINE_TEXT_INPUT_MODE", "clipboard").strip().lower()
+if DEFAULT_TEXT_INPUT_MODE not in ("clipboard", "type"):
+    logging.warning(
+        "Invalid FROSHINE_TEXT_INPUT_MODE=%s; falling back to 'clipboard'.",
+        DEFAULT_TEXT_INPUT_MODE,
+    )
+    DEFAULT_TEXT_INPUT_MODE = "clipboard"
+DEFAULT_INPUT_TARGET = os.getenv("FROSHINE_INPUT_TARGET", "auto").strip().lower()
+VALID_INPUT_TARGETS = {
+    "auto",
+    "linux-terminal",
+    "linux-gui",
+    "mac",
+    "windows",
+}
+if DEFAULT_INPUT_TARGET not in VALID_INPUT_TARGETS:
+    logging.warning(
+        "Invalid FROSHINE_INPUT_TARGET=%s; falling back to 'auto'.",
+        DEFAULT_INPUT_TARGET,
+    )
+    DEFAULT_INPUT_TARGET = "auto"
+
+
+def resolve_default_input_target() -> str:
+    if DEFAULT_INPUT_TARGET != "auto":
+        return DEFAULT_INPUT_TARGET
+    if sys.platform == "darwin":
+        return "mac"
+    if os.name == "nt":
+        return "windows"
+    return "linux-gui"
+
+
+def resolve_default_paste_shortcut(target: str) -> str:
+    if target == "mac":
+        return "cmd+v"
+    if target == "windows":
+        return "ctrl+v"
+    if target == "linux-gui":
+        return "ctrl+v"
+    return "ctrl+shift+v"
+
+
+RESOLVED_INPUT_TARGET = resolve_default_input_target()
+DEFAULT_PASTE_SHORTCUT_VALUE = resolve_default_paste_shortcut(RESOLVED_INPUT_TARGET)
+DEFAULT_PASTE_SHORTCUT = (
+    os.getenv("FROSHINE_PASTE_SHORTCUT", DEFAULT_PASTE_SHORTCUT_VALUE).strip()
+    or DEFAULT_PASTE_SHORTCUT_VALUE
+)
+TERMINAL_WINDOW_CLASSES = {
+    "gnome-terminal",
+    "gnome-terminal-server",
+    "ptyxis",
+    "kgx",
+    "tilix",
+    "xfce4-terminal",
+    "konsole",
+    "xterm",
+    "uxterm",
+    "rxvt",
+    "urxvt",
+    "alacritty",
+    "kitty",
+    "wezterm",
+    "st",
+    "tabby",
+    "terminator",
+    "io.elementary.terminal",
+    "org.gnome.console",
+}
 
 
 def build_flow_commands():
@@ -351,6 +425,80 @@ def log_transcription(transcription, is_command=False, confidence=None):
     logging.info(log_entry)
 
 
+class AutomationBackend:
+    def insert_text(self, text: str) -> None:
+        raise NotImplementedError
+
+    def press_key(self, key: str) -> None:
+        raise NotImplementedError
+
+    def click(self, button: int) -> None:
+        raise NotImplementedError
+
+    def activate_window_by_name(self, name: str) -> None:
+        raise NotImplementedError
+
+
+class LinuxX11AutomationBackend(AutomationBackend):
+    def insert_text(self, text: str) -> None:
+        if not text:
+            return
+        if DEFAULT_TEXT_INPUT_MODE == "clipboard" and paste_text_via_clipboard(text):
+            return
+        subprocess.run(
+            ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text],
+            check=False,
+        )
+
+    def press_key(self, key: str) -> None:
+        subprocess.run(["xdotool", "key", key], check=False)
+
+    def click(self, button: int) -> None:
+        subprocess.run(["xdotool", "click", str(button)], check=False)
+
+    def activate_window_by_name(self, name: str) -> None:
+        subprocess.run(
+            ["xdotool", "search", "--name", name, "windowactivate"],
+            check=False,
+        )
+
+
+class UnsupportedAutomationBackend(AutomationBackend):
+    def insert_text(self, text: str) -> None:
+        if not text:
+            return
+        if DEFAULT_TEXT_INPUT_MODE == "clipboard" and paste_text_via_clipboard(text):
+            return
+        logging.warning(
+            "Text insertion fallback is unavailable on this platform without a native backend."
+        )
+
+    def press_key(self, key: str) -> None:
+        logging.warning("Key automation is unavailable on this platform: %s", key)
+
+    def click(self, button: int) -> None:
+        logging.warning("Mouse automation is unavailable on this platform: %s", button)
+
+    def activate_window_by_name(self, name: str) -> None:
+        logging.warning("Window activation is unavailable on this platform: %s", name)
+
+
+automation_backend = None
+
+
+def get_automation_backend() -> AutomationBackend:
+    global automation_backend
+    if automation_backend is not None:
+        return automation_backend
+    if os.name != "nt" and sys.platform != "darwin" and shutil.which("xdotool"):
+        automation_backend = LinuxX11AutomationBackend()
+        logging.info("Using automation backend: linux-x11")
+    else:
+        automation_backend = UnsupportedAutomationBackend()
+        logging.info("Using automation backend: unsupported")
+    return automation_backend
+
+
 def execute_command(command):
     global running, is_paused, command_mode
     logging.info("Command recognized: %s", command)
@@ -379,11 +527,11 @@ def execute_command(command):
         print("Command mode disabled.")
         return
     if command == "enter":
-        subprocess.run(["xdotool", "key", "Return"])
+        get_automation_backend().press_key("Return")
     elif command == "switch to browser":
-        subprocess.run(["xdotool", "search", "--name", "Browser", "windowactivate"])
+        get_automation_backend().activate_window_by_name("Browser")
     elif command == "save file":
-        subprocess.run(["xdotool", "key", "ctrl+s"])
+        get_automation_backend().press_key("ctrl+s")
     elif command == "pause":
         is_paused = True
         print("Transcription paused.")
@@ -392,6 +540,197 @@ def execute_command(command):
         print("Transcription resumed.")
     else:
         print(f"Unknown command: {command}")
+
+
+def get_clipboard_commands() -> tuple[list[str] | None, list[str] | None]:
+    if sys.platform == "darwin":
+        copy_cmd = ["pbcopy"] if shutil.which("pbcopy") else None
+        read_cmd = ["pbpaste"] if shutil.which("pbpaste") else None
+        return copy_cmd, read_cmd
+    if os.name == "nt":
+        copy_cmd = ["clip.exe"] if shutil.which("clip.exe") else None
+        read_cmd = (
+            ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"]
+            if shutil.which("powershell")
+            else None
+        )
+        return copy_cmd, read_cmd
+
+    if os.environ.get("WAYLAND_DISPLAY"):
+        copy_cmd = (
+            ["wl-copy", "--type", "text/plain"]
+            if shutil.which("wl-copy")
+            else None
+        )
+        read_cmd = (
+            ["wl-paste", "--no-newline"]
+            if shutil.which("wl-paste")
+            else None
+        )
+        if copy_cmd:
+            return copy_cmd, read_cmd
+
+    if shutil.which("xclip"):
+        return (
+            ["xclip", "-selection", "clipboard", "-in"],
+            ["xclip", "-selection", "clipboard", "-out"],
+        )
+    if shutil.which("xsel"):
+        return (
+            ["xsel", "--clipboard", "--input"],
+            ["xsel", "--clipboard", "--output"],
+        )
+    return None, None
+
+
+def read_clipboard_text(read_cmd: list[str] | None) -> str | None:
+    if not read_cmd:
+        return None
+    try:
+        result = subprocess.run(
+            read_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout
+    except Exception as exc:
+        logging.warning("Failed to read clipboard for restore: %s", exc)
+        return None
+
+
+def write_clipboard_text(copy_cmd: list[str] | None, text: str) -> bool:
+    if not copy_cmd:
+        return False
+    try:
+        subprocess.run(copy_cmd, input=text, text=True, check=True)
+        return True
+    except Exception as exc:
+        logging.warning("Failed to write clipboard text: %s", exc)
+        return False
+
+
+def get_active_window_class() -> str | None:
+    if os.name == "nt" or sys.platform == "darwin":
+        return None
+    if not shutil.which("xdotool") or not shutil.which("xprop"):
+        return None
+    try:
+        window_id_result = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        window_id = window_id_result.stdout.strip()
+        if not window_id:
+            return None
+        class_result = subprocess.run(
+            ["xprop", "-id", window_id, "WM_CLASS"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = class_result.stdout.strip()
+        match = re.search(r'=\s*"([^"]+)"(?:,\s*"([^"]+)")?', output)
+        if not match:
+            return None
+        classes = [part.lower() for part in match.groups() if part]
+        for window_class in classes:
+            if window_class in TERMINAL_WINDOW_CLASSES:
+                return window_class
+        return classes[0] if classes else None
+    except Exception as exc:
+        logging.debug("Failed to detect active window class: %s", exc)
+        return None
+
+
+def resolve_effective_input_target() -> str:
+    if DEFAULT_INPUT_TARGET != "auto":
+        return DEFAULT_INPUT_TARGET
+    if sys.platform == "darwin":
+        return "mac"
+    if os.name == "nt":
+        return "windows"
+    window_class = get_active_window_class()
+    if window_class in TERMINAL_WINDOW_CLASSES:
+        return "linux-terminal"
+    return "linux-gui"
+
+
+def resolve_effective_paste_shortcut() -> str:
+    if "FROSHINE_PASTE_SHORTCUT" in os.environ:
+        return DEFAULT_PASTE_SHORTCUT
+    return resolve_default_paste_shortcut(resolve_effective_input_target())
+
+
+def paste_text_via_clipboard(text: str) -> bool:
+    copy_cmd, read_cmd = get_clipboard_commands()
+    if not copy_cmd:
+        logging.info("Clipboard paste unavailable; no clipboard command found.")
+        return False
+
+    window_class = get_active_window_class()
+    input_target = resolve_effective_input_target()
+    paste_shortcut = resolve_effective_paste_shortcut()
+    logging.info(
+        "Clipboard paste start: target=%s window_class=%s shortcut=%s chars=%s",
+        input_target,
+        window_class or "unknown",
+        paste_shortcut,
+        len(text),
+    )
+    previous_clipboard = read_clipboard_text(read_cmd)
+    if not write_clipboard_text(copy_cmd, text):
+        return False
+
+    try:
+        if sys.platform == "darwin" and shutil.which("osascript"):
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "System Events" to keystroke "v" using command down',
+                ],
+                check=True,
+            )
+        else:
+            subprocess.run(
+                [
+                    "xdotool",
+                    "key",
+                    "--clearmodifiers",
+                    paste_shortcut,
+                ],
+                check=True,
+            )
+        logging.info("Clipboard paste sent successfully.")
+        return True
+    except Exception as exc:
+        logging.warning("Clipboard paste failed; falling back to typed text: %s", exc)
+        return False
+    finally:
+        if previous_clipboard is not None:
+            time.sleep(0.1)
+            current_clipboard = read_clipboard_text(read_cmd)
+            if current_clipboard == text:
+                restored = write_clipboard_text(copy_cmd, previous_clipboard)
+                if restored:
+                    logging.info("Clipboard restore succeeded.")
+                else:
+                    logging.warning("Clipboard restore failed.")
+            else:
+                logging.info(
+                    "Clipboard restore skipped; clipboard changed after paste."
+                )
+        else:
+            logging.info("Clipboard restore skipped; previous clipboard unavailable.")
+
+
+def inject_text(text: str):
+    if not text:
+        return
+    get_automation_backend().insert_text(text)
 
 
 def normalize_word(word: str) -> str:
@@ -424,7 +763,7 @@ def type_text_raw(text: str):
     global typed_history
     if not text:
         return
-    subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text])
+    inject_text(text)
     typed_history += text
 
 
@@ -433,9 +772,9 @@ def execute_flow_action(action):
     if action_type == "text":
         type_text_raw(value)
     elif action_type == "key":
-        subprocess.run(["xdotool", "key", value])
+        get_automation_backend().press_key(value)
     elif action_type == "click":
-        subprocess.run(["xdotool", "click", str(value)])
+        get_automation_backend().click(value)
 
 
 def execute_macro(steps):
@@ -644,7 +983,7 @@ def type_text(text: str, add_space: bool = False):
     payload = prefix + text
     if add_space and payload and payload[-1] not in {".", "!", "?", " "}:
         payload += " "
-    subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", payload])
+    inject_text(payload)
     typed_history += payload
 
 
@@ -891,6 +1230,51 @@ class OutputManager:
         self.lock = threading.Lock()
         self.audio_opened_at = None
 
+    @staticmethod
+    def _wav_duration_seconds(path: Path) -> float:
+        with wave.open(str(path), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            if frame_rate <= 0:
+                return 0.0
+            return wav_file.getnframes() / float(frame_rate)
+
+    @staticmethod
+    def _parse_ffmpeg_progress_seconds(key: str, value: str) -> float | None:
+        try:
+            if key == "out_time_us":
+                return max(float(value) / 1_000_000.0, 0.0)
+            if key == "out_time_ms":
+                return max(float(value) / 1_000_000.0, 0.0)
+            if key == "out_time":
+                hours, minutes, seconds = value.split(":")
+                return (
+                    int(hours) * 3600
+                    + int(minutes) * 60
+                    + float(seconds)
+                )
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    @staticmethod
+    def _print_encode_progress(
+        processed_seconds: float,
+        total_seconds: float,
+        target: Path,
+    ) -> None:
+        if total_seconds > 0:
+            percent = min(max(processed_seconds / total_seconds, 0.0), 1.0)
+            bar_width = 24
+            filled = min(int(percent * bar_width), bar_width)
+            bar = "#" * filled + "-" * (bar_width - filled)
+            message = (
+                f"\rEncoding audio {target.name} [{bar}] {percent * 100:5.1f}% "
+                f"({processed_seconds:.1f}s / {total_seconds:.1f}s)"
+            )
+        else:
+            message = f"\rEncoding audio {target.name} ({processed_seconds:.1f}s processed)"
+        print(message, end="", file=sys.stderr, flush=True)
+
     def _open_audio_segment(self, date_prefix: str):
         if self.audio_format == "opus":
             self.audio_path = next_output_path(
@@ -933,12 +1317,16 @@ class OutputManager:
             return
         temp_wav = self.audio_tmp_path
         target = self.audio_path
+        total_duration = self._wav_duration_seconds(temp_wav)
         cmd = [
             "ffmpeg",
             "-y",
             "-hide_banner",
             "-loglevel",
             "error",
+            "-progress",
+            "pipe:1",
+            "-nostats",
             "-i",
             str(temp_wav),
             "-c:a",
@@ -952,17 +1340,59 @@ class OutputManager:
             str(target),
         ]
         try:
-            subprocess.run(cmd, check=True)
+            emit_console_status(
+                f"Finalizing audio: encoding Opus to {target}."
+            )
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            last_bucket = -1
+            if process.stdout:
+                for raw_line in process.stdout:
+                    line = raw_line.strip()
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    processed_seconds = self._parse_ffmpeg_progress_seconds(key, value)
+                    if processed_seconds is not None:
+                        if total_duration > 0:
+                            bucket = min(
+                                int((processed_seconds / total_duration) * 100),
+                                100,
+                            )
+                        else:
+                            bucket = int(processed_seconds)
+                        if bucket != last_bucket:
+                            self._print_encode_progress(
+                                processed_seconds, total_duration, target
+                            )
+                            last_bucket = bucket
+            return_code = process.wait()
+            stderr_text = ""
+            if process.stderr:
+                stderr_text = process.stderr.read().strip()
+            print(file=sys.stderr, flush=True)
+            if return_code != 0:
+                raise subprocess.CalledProcessError(
+                    return_code,
+                    cmd,
+                    stderr=stderr_text,
+                )
             temp_wav.unlink(missing_ok=True)
-            logging.info(
-                "Saved audio to %s (opus %sk)",
-                target,
-                self.audio_bitrate_kbps,
+            emit_console_status(
+                f"Saved audio to {target} (opus {self.audio_bitrate_kbps}k)."
             )
         except Exception as exc:
             fallback = target.with_suffix(".wav")
             try:
                 temp_wav.replace(fallback)
+                emit_console_status(
+                    f"Opus conversion failed; kept WAV fallback at {fallback}."
+                )
                 logging.warning(
                     "Opus conversion failed (%s). Kept WAV fallback at %s.",
                     exc,

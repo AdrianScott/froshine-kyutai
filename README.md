@@ -140,7 +140,7 @@ Environment / CLI parameters:
 - `FROSHINE_KYUTAI_WS_URL` or `--ws-url`: websocket endpoint.
 - `FROSHINE_KYUTAI_API_KEY` or `--api-key`: API key header for `moshi-server`.
 - `FROSHINE_KYUTAI_VAD_HEAD` and `FROSHINE_KYUTAI_VAD_THRESHOLD`: tweak semantic pause detection.
-- `FROSHINE_COMMAND_WORD`, `FROSHINE_COMMAND_WORD_ALIASES`, `FROSHINE_REQUIRE_WAKE_WORD`, `--word`, or `--no-wake-word`: configure or disable the wake word requirement. When disabled, commands such as “pause” execute as soon as they are recognized, no prefix needed.
+- `FROSHINE_COMMAND_WORD`, `FROSHINE_COMMAND_WORD_ALIASES`, `FROSHINE_COMMAND_WORD_SIMILARITY`, `FROSHINE_REQUIRE_WAKE_WORD`, `--word`, or `--no-wake-word`: configure or disable the wake word requirement. When disabled, commands such as “pause” execute as soon as they are recognized, no prefix needed. The default `flow` setup now includes built-in fallback aliases such as `flo`, `glow`, `flowe`, `fro`, `hello`, and `helo`, and uses a slightly more permissive default similarity threshold (`0.65`).
 - `FROSHINE_KYUTAI_CONFIG` (or `--config` in the tuning/server helpers): choose which Kyutai TOML config to tune/run.
 - `FROSHINE_AUTO_SERVER=1` (or `--no-auto-server` to disable): auto-start a local `moshi-server` when the websocket is unavailable.
 - `FROSHINE_MOSHI_SERVER_ARGS`: extra args forwarded to `moshi-server` when auto-starting (overrides auto-selected `--addr`/`--port` if provided).
@@ -157,6 +157,10 @@ Environment / CLI parameters:
 - `FROSHINE_AUDIO_ROTATE_HOURS` or `--audio-rotate-hours`: rotate audio WAV files every N hours (0 disables; default: 1).
 - `FROSHINE_AUDIO_FORMAT` or `--audio-format`: saved audio format (`opus` default, or `wav`).
 - `FROSHINE_AUDIO_BITRATE_KBPS` or `--audio-bitrate-kbps`: target bitrate when using Opus (default: 16).
+- `FROSHINE_TEXT_INPUT_MODE` (default: `clipboard`): dictated text injection mode. `clipboard` pastes text via the system clipboard and falls back to typed keystrokes if clipboard tooling is unavailable; `type` keeps the old `xdotool type` behavior.
+- `FROSHINE_INPUT_TARGET` (default: `auto`): target profile for dictated text insertion. Supported values are `linux-terminal`, `linux-gui`, `mac`, `windows`, or `auto`. On Linux, `auto` now inspects the focused window class and uses terminal paste shortcuts for common terminal apps, otherwise it uses GUI-editor paste behavior.
+- `FROSHINE_PASTE_SHORTCUT`: key chord used after copying dictated text to the clipboard. The default comes from `FROSHINE_INPUT_TARGET`: `ctrl+shift+v` for `linux-terminal`, `ctrl+v` for `linux-gui` and `windows`, and `cmd+v` for `mac`. Override this directly for app-specific behavior.
+- Text insertion, key presses, clicks, and window activation now route through an automation backend in the Python client. The current implementation is Linux/X11-first, but this backend seam is intended for future macOS and Windows adapters.
 - Saved files are named like `2026-02-21-audio-1.ogg` (Opus) or `2026-02-21-audio-1.wav`, and `2026-02-21-text-1.txt`.
 
 ## Troubleshooting 
